@@ -1,0 +1,12 @@
+{
+  "name": "shadowrocket-public-ip-whitelist",
+  "version": "1.0.0",
+  "private": true,
+  "description": "通过 Shadowrocket 检测公网 IP 变化并调用 HTTPS 加白接口",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "mock": "node mock/server.js",
+    "prepare:import": "node scripts/prepare-import.js"
+  }
+}

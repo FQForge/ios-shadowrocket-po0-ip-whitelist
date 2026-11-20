@@ -1,0 +1,21 @@
+项目名称：iOS Shadowrocket 自动公网 IP 加白模块
+
+参考地址：
+https://raw.githubusercontent.com/w0ven/po0fw/main/shadowrocket/po0-firewall-whitelist.srmodule
+
+开发目标：
+1. 自主开发 .srmodule 和 JavaScript。
+2. 通过 GitHub Raw URL 一键导入小火箭。
+3. 监听 Wi-Fi/4G/5G 网络切换。
+4. 同一个 Wi-Fi 或 5G 下公网 IP 变化也能检测。
+5. 默认每 5 分钟检查。
+6. IP 变化自动请求用户配置的 HTTPS 加白接口。
+7. 支持 IPv4、IPv6、Token、GET/POST、失败重试。
+8. 不使用 po0 服务器、Token、API。
+9. 不要求在 iPhone 上安装其他软件。
+10. 开发、模拟测试、修复并交付完整 GitHub 仓库。
+11. 给出中文 README 和小火箭一键导入教程。
+12. 不虚构真实 iPhone 测试结果。
+
+注意：没有实际加白 API 时，先用 Mock API 测试，
+不得声称仅靠 .srmodule 就能修改 VPS 防火墙。
