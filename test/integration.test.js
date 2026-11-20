@@ -22,6 +22,7 @@ const po0Origin = "https://124.221.69.228";
 const fakePo0Token = "pgnfw_" + "0123456789abcdef".repeat(4);
 const po0StatusPath = "/api/firewall/" + fakePo0Token;
 const po0AddPath = po0StatusPath + "/add";
+const po0Confirmed = "[IP 加白] po0 已确认当前 IPv4 在白名单中";
 
 async function fixture(t, { token = defaultToken, intercept } = {}) {
   const calls = [];
@@ -82,7 +83,7 @@ async function fixture(t, { token = defaultToken, intercept } = {}) {
     return runArgument(argument);
   }
 
-  function runArgument(argument) {
+  function runArgument(argument, globals = {}) {
     return new Promise((resolve, reject) => {
       const watchdog = setTimeout(() => reject(new Error("Script did not call $done")), 15000);
       const recordLog = (...args) => { logs.push(args.map(String).join(" ")); };
@@ -103,7 +104,8 @@ async function fixture(t, { token = defaultToken, intercept } = {}) {
           },
           setTimeout,
           clearTimeout,
-          $done: () => { clearTimeout(watchdog); resolve(); }
+          $done: () => { clearTimeout(watchdog); resolve(); },
+          ...globals
         }, { timeout: 1000 });
       } catch (error) {
         clearTimeout(watchdog);
@@ -118,7 +120,29 @@ async function fixture(t, { token = defaultToken, intercept } = {}) {
   };
 }
 
-test("po0 module checks the current subnet and adds it when missing", async t => {
+test("po0 sends its add request without script timers or persistent storage", async t => {
+  const { runArgument, requests } = await fixture(t, {
+    intercept(req, res, url) {
+      if (req.method !== "POST" || url.pathname !== po0AddPath) return false;
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        enabled: true,
+        currentIp: "8.8.8.0/24",
+        whitelist: [{ ip: "8.8.8.0/24", slot: 0 }]
+      }));
+      return true;
+    }
+  });
+  await runArgument('"po0Token=' + fakePo0Token + '"', {
+    setTimeout: undefined,
+    clearTimeout: undefined,
+    $persistentStore: undefined
+  });
+  assert.deepEqual(requests.map(({ method, path }) => [method, path]), [["POST", po0AddPath]]);
+});
+
+test("po0 module posts on both triggers and repeated adds do not duplicate a subnet", async t => {
   const modulePath = join(__dirname, "..", "shadowrocket", "public-ip-whitelist.srmodule");
   const moduleText = readFileSync(modulePath, "utf8");
   assert.match(moduleText, /^IP-CIDR,124\.221\.69\.228\/32,DIRECT,no-resolve$/m);
@@ -127,9 +151,8 @@ test("po0 module checks the current subnet and adds it when missing", async t =>
   const rules = scriptSection.split(/\r?\n/).map(line => line.slice(line.indexOf("=") + 1).trim());
   const event = rules.find(rule => rule.startsWith("type=event,"));
   const schedule = rules.find(rule => rule.startsWith("type=cron,"));
-  // Both forms are demonstrated by the community Cloudflare.DNS.srmodule.
-  assert.match(event, /^type=event,\s*network-changed,/);
-  assert.match(schedule, /^type=cron,\s*cronexp="\*\/5 \* \* \* \*",/);
+  assert.match(event, /^type=event,\s*event-name=network-changed,/);
+  assert.match(schedule, /^type=cron,\s*cronexpr="\*\/5 \* \* \* \*",/);
 
   const argumentDefaults = moduleText.match(/^#!arguments=(.+)$/m)?.[1];
   assert.ok(argumentDefaults, "Missing module parameter defaults");
@@ -143,24 +166,18 @@ test("po0 module checks the current subnet and adds it when missing", async t =>
     assert.equal(scriptUrl.hostname, "raw.githubusercontent.com");
     assert.ok(scriptUrl.pathname.endsWith("/" + filename), "Unexpected script file");
 
-    const argument = rule.match(/,\s*argument=("[^"]+")$/)?.[1];
-    assert.ok(argument, "Missing quoted argument template");
+    const argument = rule.match(/,\s*argument=([^,]+)$/)?.[1];
+    assert.ok(argument, "Missing argument template");
     return argument.replace(/\{\{\{(\w+)\}\}\}/g, (_match, name) => {
       assert.ok(Object.hasOwn(settings, name), "Unknown module parameter: " + name);
       return settings[name];
     });
   }
 
-  let currentIp = firstV4;
   let currentSubnet = "8.8.8.0/24";
   const whitelist = new Set();
   const { runArgument, calls, requests, logs, storage } = await fixture(t, {
     intercept(req, res, url) {
-      if (req.method === "GET" && url.pathname === po0StatusPath) {
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ currentIp, whitelist: [...whitelist] }));
-        return true;
-      }
       if (req.method === "POST" && url.pathname === po0AddPath) {
         req.resume();
         whitelist.add(currentSubnet);
@@ -182,16 +199,16 @@ test("po0 module checks the current subnet and adds it when missing", async t =>
   const settings = { token: fakePo0Token };
   const eventArgument = renderArgument(event, settings);
   const scheduleArgument = renderArgument(schedule, settings);
-  assert.equal(eventArgument, '"po0Token=' + fakePo0Token + '"');
-  assert.equal(scheduleArgument, eventArgument);
+  assert.equal(eventArgument, "po0NetworkToken=" + fakePo0Token);
+  assert.equal(scheduleArgument, "po0Token=" + fakePo0Token);
 
   await runArgument(eventArgument);
   assert.deepEqual([...whitelist], ["8.8.8.0/24"]);
-  currentIp = "8.8.8.40";
+  assert.ok(logs.some(line => line.includes("检测到网络切换")));
+  assert.ok(logs.includes(po0Confirmed));
   await runArgument(scheduleArgument);
-  assert.deepEqual(calls.map(call => call.method), ["GET", "POST", "GET"]);
+  assert.deepEqual([...whitelist], ["8.8.8.0/24"]);
 
-  currentIp = nextV4;
   currentSubnet = "1.1.1.0/24";
   await runArgument(scheduleArgument);
   assert.deepEqual([...whitelist], ["8.8.8.0/24", "1.1.1.0/24"]);
@@ -199,12 +216,9 @@ test("po0 module checks the current subnet and adds it when missing", async t =>
   whitelist.delete(currentSubnet);
   await runArgument(scheduleArgument);
   assert.ok(whitelist.has(currentSubnet), "A missing entry should be restored on the next check");
-  const expectedMethods = ["GET", "POST", "GET", "GET", "POST", "GET", "POST"];
-  assert.deepEqual(calls.map(call => call.method), expectedMethods);
-  assert.deepEqual(calls.map(call => call.url), expectedMethods.map(method =>
-    po0Origin + (method === "GET" ? po0StatusPath : po0AddPath)));
-  assert.equal(calls.every(call => call.policy === "DIRECT" && !call.body), true);
-  assert.equal(requests.length, expectedMethods.length);
+  assert.deepEqual(calls.map(({ method, url, body }) => [method, url, body]),
+    Array.from({ length: 4 }, () => ["POST", po0Origin + po0AddPath, ""]));
+  assert.equal(requests.length, 4);
   assert.equal(requests.every(request => request.authorization === undefined), true);
   assert.equal(logs.join("\n").includes(fakePo0Token), false);
   assert.equal(JSON.stringify([...storage]).includes(fakePo0Token), false);
@@ -218,13 +232,15 @@ test("po0 mode rejects missing tokens and malformed URL path content before send
   assert.deepEqual(calls, []);
 });
 
-test("po0 mode skips writes when the status API rejects the token or reports disabled", async t => {
+test("po0 mode does not retry a rejected add or report success without confirmed membership", async t => {
   let status = 401;
-  const { runArgument, requests } = await fixture(t, {
+  let enabled = false;
+  const { runArgument, requests, logs } = await fixture(t, {
     intercept(req, res, url) {
-      if (req.method !== "GET" || url.pathname !== po0StatusPath) return false;
+      if (req.method !== "POST" || url.pathname !== po0AddPath) return false;
+      req.resume();
       res.writeHead(status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ enabled: false, currentIp: firstV4, whitelist: [] }));
+      res.end(JSON.stringify({ enabled, currentIp: firstV4, whitelist: ["8.8.8.40"] }));
       return true;
     }
   });
@@ -234,22 +250,20 @@ test("po0 mode skips writes when the status API rejects the token or reports dis
   await runArgument(argument);
   status = 200;
   await runArgument(argument);
-  assert.deepEqual(requests.map(({ method, path }) => [method, path]), [
-    ["GET", po0StatusPath], ["GET", po0StatusPath], ["GET", po0StatusPath]
-  ]);
+  enabled = true;
+  await runArgument(argument);
+  assert.deepEqual(requests.map(({ method, path }) => [method, path]),
+    Array.from({ length: 4 }, () => ["POST", po0AddPath]));
+  assert.ok(logs.some(line => /未启用/.test(line)));
+  assert.equal(logs.includes(po0Confirmed), false);
 });
 
-test("po0 mode retries a transient add failure", async t => {
+test("po0 retries while a switching network becomes available", async t => {
   const { runArgument, requests, logs } = await fixture(t, {
     intercept(req, res, url) {
-      if (req.method === "GET" && url.pathname === po0StatusPath) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ enabled: true, currentIp: firstV4, whitelist: [] }));
-        return true;
-      }
       if (req.method === "POST" && url.pathname === po0AddPath) {
         req.resume();
-        if (requests.length === 2) {
+        if (requests.length <= 2) {
           res.writeHead(503);
           res.end(fakePo0Token);
         } else {
@@ -263,10 +277,11 @@ test("po0 mode retries a transient add failure", async t => {
       return false;
     }
   });
-  await runArgument("po0Token=" + fakePo0Token);
+  await runArgument("po0NetworkToken=" + fakePo0Token);
   assert.deepEqual(requests.map(({ method, path }) => [method, path]), [
-    ["GET", po0StatusPath], ["POST", po0AddPath], ["POST", po0AddPath]
+    ["POST", po0AddPath], ["POST", po0AddPath], ["POST", po0AddPath]
   ]);
+  assert.ok(logs.includes(po0Confirmed));
   assert.equal(logs.join("\n").includes(fakePo0Token), false);
 });
 

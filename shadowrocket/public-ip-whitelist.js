@@ -9,6 +9,7 @@
   const PO0_API = 'https://124.221.69.228/api/firewall';
   const REQUEST_SECONDS = 5;
   const RETRY_DELAYS = [500, 1000];
+  const NETWORK_RETRY_DELAYS = [500, 1500, 3000];
   const LEASE_MS = 65000;
   const WAIT_FOR_LEASE_MS = 12000;
   const HTTPS_URL = /^https:\/\/(?:[a-z0-9][a-z0-9.-]*|\[[0-9a-f:]+\])(?::[0-9]{1,5})?(?:[/?][^\s"'#,\\|{}\u0000-\u001f\u007f]*)?$/i;
@@ -19,10 +20,18 @@
 
   function readConfig(argument) {
     const text = typeof argument === 'string' ? argument.trim().replace(/^"(.*)"$/, '$1') : '';
-    if (text.startsWith('po0Token=')) {
-      const po0Token = text.slice('po0Token='.length).trim();
-      if (/^pgnfw_[A-Za-z0-9]+$/.test(po0Token)) return { po0Token };
-      log('请在模块的「编辑参数」中填写 pgnfw_ 开头的 Token');
+    const po0Argument = /^(po0Token|po0NetworkToken)=(.*)$/.exec(text);
+    if (po0Argument) {
+      const [, name, value] = po0Argument;
+      const po0Token = value.trim();
+      if (/^pgnfw_[A-Za-z0-9]+$/.test(po0Token)) {
+        return { po0Token, networkChange: name === 'po0NetworkToken' };
+      }
+      if (po0Token === '{{{token}}}') {
+        log('小火箭未传入 Token，请按 README 的本地模块方式填写');
+      } else {
+        log('请在模块的「编辑参数」中填写 pgnfw_ 开头的 Token');
+      }
       return null;
     }
 
@@ -137,18 +146,23 @@
 
   function request(method, options) {
     return new Promise((resolve) => {
+      let timer;
       function finish(status = 0, body = '') {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         resolve({ status, body });
       }
 
-      const timer = setTimeout(finish, REQUEST_SECONDS * 1000);
       try {
-        $httpClient[method]({ timeout: REQUEST_SECONDS, 'auto-redirect': false, ...options },
-          (error, response, body) => {
-            const status = Number(response && (response.status || response.statusCode));
-            finish(error || !Number.isInteger(status) ? 0 : status, body);
-          });
+        if (typeof setTimeout === 'function' && typeof clearTimeout === 'function') {
+          timer = setTimeout(finish, REQUEST_SECONDS * 1000);
+        }
+        const requestOptions = { timeout: REQUEST_SECONDS, 'auto-redirect': false, ...options };
+        const onResponse = (error, response, body) => {
+          const status = Number(response && (response.status || response.statusCode));
+          finish(error || !Number.isInteger(status) ? 0 : status, body);
+        };
+        if (method === 'post') $httpClient.post(requestOptions, onResponse);
+        else $httpClient.get(requestOptions, onResponse);
       } catch {
         finish();
       }
@@ -206,10 +220,10 @@
     return { url: api, headers, body: JSON.stringify({ ip, family }) };
   }
 
-  async function requestWithRetry(method, options, action) {
+  async function requestWithRetry(method, options, action, delays = RETRY_DELAYS) {
     let response;
-    for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt += 1) {
-      if (attempt > 0) await sleep(RETRY_DELAYS[attempt - 1]);
+    for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+      if (attempt > 0 && typeof setTimeout === 'function') await sleep(delays[attempt - 1]);
       response = await request(method, options);
       const { status } = response;
       if (isSuccess(status)) break;
@@ -227,12 +241,14 @@
     return isSuccess(status);
   }
 
-  function po0Subnet(value) {
+  function po0Address(value) {
     if (typeof value !== 'string') return null;
     const [address, prefix, ...extra] = value.trim().split('/');
     if (extra.length || (prefix !== undefined && prefix !== '24')) return null;
     const ip = normalizeV4(address);
-    return ip ? ip.slice(0, ip.lastIndexOf('.')) : null;
+    if (!ip) return null;
+    const subnet = prefix === '24' ? ip.slice(0, ip.lastIndexOf('.') + 1) : null;
+    return { ip, subnet };
   }
 
   function readPo0State(body) {
@@ -245,39 +261,38 @@
     if (!data || typeof data !== 'object') return null;
     if (data.enabled === false) return { enabled: false, listed: false };
 
-    const currentSubnet = po0Subnet(data.currentIp);
-    if (!currentSubnet || !Array.isArray(data.whitelist)) return null;
+    const current = po0Address(data.currentIp);
+    if (!current || !Array.isArray(data.whitelist)) return null;
     const listed = data.whitelist.some((entry) => {
-      const address = typeof entry === 'string' ? entry : entry && entry.ip;
-      return po0Subnet(address) === currentSubnet;
+      const address = po0Address(typeof entry === 'string' ? entry : entry && entry.ip);
+      if (!address) return false;
+      if (address.ip === current.ip) return true;
+      if (address.subnet) return current.ip.startsWith(address.subnet);
+      return current.subnet !== null && address.ip.startsWith(current.subnet);
     });
     return { enabled: data.enabled, listed };
   }
 
-  async function ensurePo0(token) {
-    const url = `${PO0_API}/${encodeURIComponent(token)}`;
-    const options = { policy: 'DIRECT', headers: { Accept: 'application/json' } };
-    const statusResponse = await request('get', { ...options, url });
-    if (statusResponse.status === 401 || statusResponse.status === 403) {
-      log(`po0 接口拒绝访问（HTTP ${statusResponse.status}），请检查 Token`);
+  async function ensurePo0(token, networkChange) {
+    log(networkChange ? '检测到网络切换，正在向 po0 请求加白' : '定时触发，正在向 po0 请求加白');
+    const options = {
+      url: `${PO0_API}/${encodeURIComponent(token)}/add`,
+      policy: 'DIRECT',
+      headers: { 'Content-Type': 'application/json' },
+      body: '',
+    };
+    const delays = networkChange ? NETWORK_RETRY_DELAYS : RETRY_DELAYS;
+    const added = await requestWithRetry('post', options, 'po0 加白', delays);
+    if (!isSuccess(added.status)) {
+      if ([400, 401, 403, 404].includes(added.status)) {
+        log('请在 po0 控制台核对模块内的 Token 和机器详情页的加白地址');
+      }
       return;
     }
 
-    const current = isSuccess(statusResponse.status) ? readPo0State(statusResponse.body) : null;
-    if (current && current.enabled === false) {
-      log('po0 防火墙尚未启用');
-      return;
-    }
-    if (current && current.listed) {
-      log('当前 IPv4 网段已在 po0 白名单中');
-      return;
-    }
-
-    const added = await requestWithRetry('post', { ...options, url: `${url}/add` }, 'po0 加白');
-    if (!isSuccess(added.status)) return;
     const result = readPo0State(added.body);
     if (result && result.enabled === true && result.listed) {
-      log('当前 IPv4 网段已加入 po0 白名单');
+      log('po0 已确认当前 IPv4 在白名单中');
     } else if (result && result.enabled === false) {
       log('po0 防火墙尚未启用');
     } else {
@@ -289,7 +304,12 @@
     const config = readConfig(typeof $argument === 'undefined' ? '' : $argument);
     if (!config) return;
 
-    const key = config.po0Token ? `${PREFIX}:po0` : `${PREFIX}:${config.method}:${config.api}`;
+    if (config.po0Token) {
+      await ensurePo0(config.po0Token, config.networkChange);
+      return;
+    }
+
+    const key = `${PREFIX}:${config.method}:${config.api}`;
     const leaseKey = `${key}:lease`;
     const lease = await takeLease(leaseKey);
     if (!lease) {
@@ -298,11 +318,6 @@
     }
 
     try {
-      if (config.po0Token) {
-        await ensurePo0(config.po0Token);
-        return;
-      }
-
       const addresses = await Promise.all(config.enabled.map((family) => probe(family, config.probes[family])));
       for (const [index, family] of config.enabled.entries()) {
         const ip = addresses[index];
