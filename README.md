@@ -1,8 +1,8 @@
 # iOS 小火箭 po0 加白
 
-Shadowrocket 在收到网络变更事件时检查一次公网 IP，连接期间也每 5 分钟检查一次。同一 Wi-Fi 或蜂窝网络下的出口 IP 变化由定时检查发现。首次发现地址或地址变化时，脚本会调用你配置的 HTTPS 接口，自动将新地址加入 IP 白名单。IPv4 和 IPv6 分别探测并记录。
+导入模块后，只需填写 po0 防火墙 Token。Shadowrocket 在网络切换时和连接期间每 5 分钟检查一次当前公网 IPv4 网段，发现白名单缺少该网段时自动加白。
 
-模块、脚本和 Mock API 都是独立编写的。需求文档提供的参考仅用于了解 Shadowrocket 配置格式。实际防火墙规则由你配置的接口更新，Mock API 只维护内存中的名单。
+模块、脚本和 Mock API 都是独立编写的。防火墙规则由 po0 的 HTTPS 接口更新，Mock API 维护测试用的内存名单。
 
 ## 发布到 GitHub
 
@@ -31,33 +31,19 @@ shadowrocket://install?module=https%3A%2F%2Fraw.githubusercontent.com%2FFQForge%
 <!-- import:end -->
 
 1. 将 `shadowrocket://install?...` 导入地址粘贴到 iPhone 的 Safari 地址栏，确认打开 Shadowrocket。也可以在 Shadowrocket 里进入「配置 → 模块 → +」，粘贴 Raw 地址并下载。
-2. 点击「iOS 小火箭 po0 加白」，打开「编辑参数」，填写下方的参数。当前版本的 Shadowrocket 支持这个入口。旧版本可以先更新，或在小火箭新建本地模块并手动替换两条 `argument` 里的 `{{{参数名}}}`。
-3. 启用模块，将首页「全局路由」设为「配置」并连接。这样模块中的 `DIRECT` 规则可以让默认探测走手机当前网络。
-4. 等待下一个 5 分钟刻度，或切换 Wi-Fi 与蜂窝网络。在脚本日志中查找 `[IP 加白]`，并在自己的接口上确认收到的地址。iPhone 只需 Shadowrocket，本模块无需开启 HTTPS 解密。
+2. 点击「iOS 小火箭 po0 加白」，打开「编辑参数」。在 `token` 一栏填入 po0 控制台机器详情页「防火墙」卡片上 `pgnfw_` 开头的完整 Token。接口地址和请求方式已配置好。已经导入过的用户先刷新模块。
+3. 启用模块，将首页「全局路由」设为「配置」并连接。模块的 `DIRECT` 规则会让加白请求走手机当前网络。
+4. 等待下一个 5 分钟刻度，或切换 Wi-Fi 与蜂窝网络。在脚本日志中查找 `[IP 加白]`，并到 po0 控制台核对名单。iPhone 只需 Shadowrocket，无需开启 HTTPS 解密。
 
-| 参数 | 默认值 | 填写方式 |
-| --- | --- | --- |
-| `api` | `unset` | 必填。输入完整的 HTTPS 地址，例如 `https://firewall.example.com/whitelist`。 |
-| `method` | `POST` | 支持 `GET` 或 `POST`。 |
-| `families` | `46` | `46` 同时检查两种地址，`4` 仅检查 IPv4，`6` 仅检查 IPv6。 |
-| `token` | `unset` | 输入 Bearer 后面的值。接口无需鉴权时保留默认值。真实 Token 填在手机的模块参数中。 |
-| `probe4` | `default` | 默认访问 `https://api.ipify.org/`，也可输入自己的 IPv4 HTTPS 探测地址。 |
-| `probe6` | `default` | 默认访问 `https://api6.ipify.org/`，也可输入自己的 IPv6 HTTPS 探测地址。 |
+真实 Token 填在手机的模块参数中。控制台显示的是完整加白 URL 时，复制 `/firewall/` 和 `/add` 之间的 `pgnfw_…`。
 
-自定义探测端点需返回单个对应地址族的公网 IP 纯文本。在配置中为自定义域名添加 `DOMAIN,域名,DIRECT` 规则，并确保域名按预期使用 IPv4 或 IPv6。URL 中的逗号、引号或竖线需要写成百分号编码。使用默认探测时，ipify 会接收到探测请求的出口 IP。加白用的 Token 只随加白请求发送。
+4G 和 5G 之间的切换是否立即触发取决于 iOS 是否报告网络路径变化。锁屏、断开隧道或网络重连时，检查时间也由 iOS 和 Shadowrocket 调度。
 
-4G 和 5G 之间的切换是否触发即时检查取决于 iOS 是否报告网络路径变化。锁屏、断开隧道或网络重连时，检查时间也由 iOS 和 Shadowrocket 调度。接口收到的是探测请求看到的出口 IP，请确认它和访问受保护服务时的出口一致。
+## po0 加白接口
 
-## 加白接口约定
+脚本通过 HTTPS `GET` 查询 `https://124.221.69.228/api/firewall/<token>`。当前网段缺失时，向 `https://124.221.69.228/api/firewall/<token>/add` 发送空请求体的 `POST`。查询暂不可用时，脚本可以直接尝试加白。服务端从 HTTPS 请求来源识别公网 IPv4，并以 `/24` 网段为单位加白。这个 po0 接口只支持 IPv4。
 
-| 方法 | 示例请求 |
-| --- | --- |
-| `POST` | `Content-Type: application/json`，请求体 `{"ip":"8.8.4.4","family":4}` |
-| `GET` | `/whitelist?ip=2606%3A4700%3A4700%3A%3A1111&family=6` |
-
-`family` 为 `4` 或 `6`，两种地址分别发送请求。GET 会保留已有的查询参数，`ip` 和 `family` 由脚本填写。配置 Token 后会发送 `Authorization: Bearer <token>`。请使用证书有效、可直接访问的最终 HTTPS 地址。
-
-服务端应在实际加白成功后返回 HTTP `2xx`，已存在的地址也可以直接返回成功。网络错误、超时、`408`、`429` 或 `5xx` 会在约 0.5 秒和 1 秒后最多重试两次。只有成功的地址才会记录，失败的地址下次会再检查。一种地址探测不到时，另一种仍可正常处理。服务端负责实际写入防火墙，以及管理旧记录的保留时间。现有服务若使用不同的参数名或鉴权格式，需要在接口前转换为上述约定。
+加白请求遇到网络错误、超时、`408`、`429` 或 `5xx` 时，最多重试两次。服务端确认当前网段已在白名单中后，脚本才显示加白成功。
 
 ## 在电脑上运行 Mock 测试
 
@@ -67,9 +53,9 @@ shadowrocket://install?module=https%3A%2F%2Fraw.githubusercontent.com%2FFQForge%
 npm test
 ```
 
-测试在 Node.js 中模拟 Shadowrocket 的脚本接口，覆盖 IPv4 和 IPv6 的首次提交与变化检测、GET 和 POST、Bearer、重试及并发触发。模块导入、蜂窝切换事件、锁屏调度和真实防火墙写入尚未在 iPhone 上实测。
+测试在 Node.js 中模拟 Shadowrocket 和 po0 接口，覆盖单 Token 导入、自动加白、同一网段跳过、出口变化和重试。脚本原有的自定义接口也通过本地 HTTPS 测试，覆盖 IPv4、IPv6 和 Bearer。模块导入、蜂窝切换事件、锁屏调度和真实防火墙写入尚未在 iPhone 上实测。
 
-也可以单独启动 Mock API。
+也可以单独启动用于自定义接口的 Mock API。
 
 ```sh
 npm run mock
@@ -89,4 +75,4 @@ Mock 监听 `127.0.0.1`，`/ip4` 和 `/ip6` 会返回测试用地址。按 `Ctrl
 ## 接口参考
 
 - 模块导入、编辑参数及路由设置。 [Shadowrocket 社区使用手册](https://github.com/LOWERTOP/Shadowrocket#模块)
-- 默认探测端点。 [ipify 文档](https://www.ipify.org/)
+- po0 接口格式和 IPv4 网段规则。 [po0 防火墙接口参考](https://github.com/w0ven/po0fw#原理)

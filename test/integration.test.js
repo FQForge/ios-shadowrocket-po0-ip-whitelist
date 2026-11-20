@@ -18,8 +18,13 @@ const firstV4 = "8.8.8.8";
 const nextV4 = "1.1.1.1";
 const firstV6 = "2001:4860:4860::8888";
 const expandedV6 = "2001:4860:4860:0000:0000:0000:0000:8888";
+const po0Origin = "https://124.221.69.228";
+const fakePo0Token = "pgnfw_" + "0123456789abcdef".repeat(4);
+const po0StatusPath = "/api/firewall/" + fakePo0Token;
+const po0AddPath = po0StatusPath + "/add";
 
 async function fixture(t, { token = defaultToken, intercept } = {}) {
+  const calls = [];
   const requests = [];
   const logs = [];
   const storage = new Map();
@@ -36,9 +41,13 @@ async function fixture(t, { token = defaultToken, intercept } = {}) {
 
   function httpRequest(method, rawOptions, callback) {
     const opts = typeof rawOptions === "string" ? { url: rawOptions } : rawOptions;
-    const requestedUrl = new URL(opts.url).href;
-    const mappedPath = defaultProbes.get(requestedUrl);
-    const url = new URL(mappedPath ? mock.url + mappedPath : requestedUrl);
+    const requestedUrl = new URL(opts.url);
+    calls.push({ method, url: requestedUrl.href, body: opts.body, policy: opts.policy });
+    let mappedPath = defaultProbes.get(requestedUrl.href);
+    if (requestedUrl.origin === po0Origin && [po0StatusPath, po0AddPath].includes(requestedUrl.pathname)) {
+      mappedPath = requestedUrl.pathname + requestedUrl.search;
+    }
+    const url = new URL(mappedPath ? mock.url + mappedPath : requestedUrl.href);
     if (url.origin !== mock.url) {
       callback(new Error("Simulator only allows the loopback HTTPS Mock"));
       return;
@@ -104,14 +113,15 @@ async function fixture(t, { token = defaultToken, intercept } = {}) {
   }
 
   return {
-    mock, run, runArgument, requests, logs,
+    mock, run, runArgument, calls, requests, logs, storage,
     submissions: () => mock.submissions.map(({ ip, family }) => [ip, family]).sort()
   };
 }
 
-test("module event and five minute schedule share state and submit an IP change", async t => {
+test("po0 module checks the current subnet and adds it when missing", async t => {
   const modulePath = join(__dirname, "..", "shadowrocket", "public-ip-whitelist.srmodule");
   const moduleText = readFileSync(modulePath, "utf8");
+  assert.match(moduleText, /^IP-CIDR,124\.221\.69\.228\/32,DIRECT,no-resolve$/m);
   const scriptSection = moduleText.split(/^\[Script\]$/m)[1]?.split(/^\[/m)[0];
   assert.ok(scriptSection, "Missing [Script] section");
   const rules = scriptSection.split(/\r?\n/).map(line => line.slice(line.indexOf("=") + 1).trim());
@@ -124,6 +134,7 @@ test("module event and five minute schedule share state and submit an IP change"
   const argumentDefaults = moduleText.match(/^#!arguments=(.+)$/m)?.[1];
   assert.ok(argumentDefaults, "Missing module parameter defaults");
   const defaults = Object.fromEntries(argumentDefaults.split(/,\s*/).map(entry => entry.split(":", 2)));
+  assert.deepEqual(defaults, { token: "unset" });
 
   function renderArgument(rule, settings) {
     const pathMatch = rule.match(/,\s*script-path=(https:\/\/[^,]+),/);
@@ -140,20 +151,123 @@ test("module event and five minute schedule share state and submit an IP change"
     });
   }
 
-  const { mock, runArgument, requests, submissions } = await fixture(t);
+  let currentIp = firstV4;
+  let currentSubnet = "8.8.8.0/24";
+  const whitelist = new Set();
+  const { runArgument, calls, requests, logs, storage } = await fixture(t, {
+    intercept(req, res, url) {
+      if (req.method === "GET" && url.pathname === po0StatusPath) {
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ currentIp, whitelist: [...whitelist] }));
+        return true;
+      }
+      if (req.method === "POST" && url.pathname === po0AddPath) {
+        req.resume();
+        whitelist.add(currentSubnet);
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          enabled: true,
+          currentIp: currentSubnet,
+          whitelist: [...whitelist].map(ip => ({ ip, slot: null }))
+        }));
+        return true;
+      }
+      return false;
+    }
+  });
   await runArgument(renderArgument(event, defaults));
   await runArgument(renderArgument(schedule, defaults));
-  assert.deepEqual(requests, [], "A module with default settings should make no requests");
+  assert.deepEqual(calls, [], "A module with default settings should make no requests");
 
-  const settings = { ...defaults, api: mock.url + "/whitelist", families: "4", token: defaultToken };
-  await runArgument(renderArgument(event, settings));
-  assert.deepEqual(submissions(), [[firstV4, 4]]);
-  await runArgument(renderArgument(schedule, settings));
-  assert.deepEqual(submissions(), [[firstV4, 4]]);
+  const settings = { token: fakePo0Token };
+  const eventArgument = renderArgument(event, settings);
+  const scheduleArgument = renderArgument(schedule, settings);
+  assert.equal(eventArgument, '"po0Token=' + fakePo0Token + '"');
+  assert.equal(scheduleArgument, eventArgument);
 
-  mock.ips[4] = nextV4;
-  await runArgument(renderArgument(schedule, settings));
-  assert.deepEqual(submissions(), [[nextV4, 4], [firstV4, 4]]);
+  await runArgument(eventArgument);
+  assert.deepEqual([...whitelist], ["8.8.8.0/24"]);
+  currentIp = "8.8.8.40";
+  await runArgument(scheduleArgument);
+  assert.deepEqual(calls.map(call => call.method), ["GET", "POST", "GET"]);
+
+  currentIp = nextV4;
+  currentSubnet = "1.1.1.0/24";
+  await runArgument(scheduleArgument);
+  assert.deepEqual([...whitelist], ["8.8.8.0/24", "1.1.1.0/24"]);
+
+  whitelist.delete(currentSubnet);
+  await runArgument(scheduleArgument);
+  assert.ok(whitelist.has(currentSubnet), "A missing entry should be restored on the next check");
+  const expectedMethods = ["GET", "POST", "GET", "GET", "POST", "GET", "POST"];
+  assert.deepEqual(calls.map(call => call.method), expectedMethods);
+  assert.deepEqual(calls.map(call => call.url), expectedMethods.map(method =>
+    po0Origin + (method === "GET" ? po0StatusPath : po0AddPath)));
+  assert.equal(calls.every(call => call.policy === "DIRECT" && !call.body), true);
+  assert.equal(requests.length, expectedMethods.length);
+  assert.equal(requests.every(request => request.authorization === undefined), true);
+  assert.equal(logs.join("\n").includes(fakePo0Token), false);
+  assert.equal(JSON.stringify([...storage]).includes(fakePo0Token), false);
+});
+
+test("po0 mode rejects missing tokens and malformed URL path content before sending requests", async t => {
+  const { runArgument, calls } = await fixture(t);
+  for (const value of ["", "{{{token}}}", "wrong_prefix", "pgnfw_", "pgnfw_fake/fake", "pgnfw_fake?slot=0"]) {
+    await runArgument("po0Token=" + value);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test("po0 mode skips writes when the status API rejects the token or reports disabled", async t => {
+  let status = 401;
+  const { runArgument, requests } = await fixture(t, {
+    intercept(req, res, url) {
+      if (req.method !== "GET" || url.pathname !== po0StatusPath) return false;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ enabled: false, currentIp: firstV4, whitelist: [] }));
+      return true;
+    }
+  });
+  const argument = "po0Token=" + fakePo0Token;
+  await runArgument(argument);
+  status = 403;
+  await runArgument(argument);
+  status = 200;
+  await runArgument(argument);
+  assert.deepEqual(requests.map(({ method, path }) => [method, path]), [
+    ["GET", po0StatusPath], ["GET", po0StatusPath], ["GET", po0StatusPath]
+  ]);
+});
+
+test("po0 mode retries a transient add failure", async t => {
+  const { runArgument, requests, logs } = await fixture(t, {
+    intercept(req, res, url) {
+      if (req.method === "GET" && url.pathname === po0StatusPath) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ enabled: true, currentIp: firstV4, whitelist: [] }));
+        return true;
+      }
+      if (req.method === "POST" && url.pathname === po0AddPath) {
+        req.resume();
+        if (requests.length === 2) {
+          res.writeHead(503);
+          res.end(fakePo0Token);
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            enabled: true, currentIp: "8.8.8.0/24", whitelist: [{ ip: "8.8.8.0/24", slot: null }]
+          }));
+        }
+        return true;
+      }
+      return false;
+    }
+  });
+  await runArgument("po0Token=" + fakePo0Token);
+  assert.deepEqual(requests.map(({ method, path }) => [method, path]), [
+    ["GET", po0StatusPath], ["POST", po0AddPath], ["POST", po0AddPath]
+  ]);
+  assert.equal(logs.join("\n").includes(fakePo0Token), false);
 });
 
 test("sends each family on first run and only submits changed IPs on later runs", async t => {

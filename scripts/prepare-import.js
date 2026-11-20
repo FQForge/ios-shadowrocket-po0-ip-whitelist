@@ -24,7 +24,7 @@ async function main() {
   const scriptUrl = `${raw}/public-ip-whitelist.js`;
   const importUrl = `shadowrocket://install?module=${encodeURIComponent(moduleUrl)}`;
 
-  const scriptLinks = /script-path=[^,\r\n]+/g;
+  const scriptLinks = /script-path=[^,?\r\n]+/g;
   const readmeLinks = /<!-- import:start -->[\s\S]*?<!-- import:end -->/;
   if ((module.match(scriptLinks) || []).length !== 2 || !readmeLinks.test(readme)) {
     throw new Error('找不到两条 script-path 或 README 的导入链接区块');

@@ -6,6 +6,7 @@
     4: 'https://api.ipify.org/',
     6: 'https://api6.ipify.org/',
   };
+  const PO0_API = 'https://124.221.69.228/api/firewall';
   const REQUEST_SECONDS = 5;
   const RETRY_DELAYS = [500, 1000];
   const LEASE_MS = 65000;
@@ -17,8 +18,15 @@
   const isSuccess = (status) => status >= 200 && status < 300;
 
   function readConfig(argument) {
-    const fields = Object.create(null);
     const text = typeof argument === 'string' ? argument.trim().replace(/^"(.*)"$/, '$1') : '';
+    if (text.startsWith('po0Token=')) {
+      const po0Token = text.slice('po0Token='.length).trim();
+      if (/^pgnfw_[A-Za-z0-9]+$/.test(po0Token)) return { po0Token };
+      log('请在模块的「编辑参数」中填写 pgnfw_ 开头的 Token');
+      return null;
+    }
+
+    const fields = Object.create(null);
     for (const entry of text.split('|')) {
       const separator = entry.indexOf('=');
       if (separator > 0) fields[entry.slice(0, separator)] = entry.slice(separator + 1).trim();
@@ -198,25 +206,90 @@
     return { url: api, headers, body: JSON.stringify({ ip, family }) };
   }
 
-  async function submit(config, family, ip) {
-    const options = allowlistRequest(config, family, ip);
+  async function requestWithRetry(method, options, action) {
+    let response;
     for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt += 1) {
       if (attempt > 0) await sleep(RETRY_DELAYS[attempt - 1]);
-      const { status } = await request(config.method.toLowerCase(), options);
-      if (isSuccess(status)) return true;
-      log(`IPv${family} 加白请求第 ${attempt + 1} 次失败（${status ? `HTTP ${status}` : '网络错误或超时'}）`);
+      response = await request(method, options);
+      const { status } = response;
+      if (isSuccess(status)) break;
+      log(`${action}请求第 ${attempt + 1} 次失败（${status ? `HTTP ${status}` : '网络错误或超时'}）`);
       if (!(status === 0 || status === 408 || status === 429 || (status >= 500 && status <= 599))) {
         break;
       }
     }
-    return false;
+    return response;
+  }
+
+  async function submit(config, family, ip) {
+    const options = allowlistRequest(config, family, ip);
+    const { status } = await requestWithRetry(config.method.toLowerCase(), options, `IPv${family} 加白`);
+    return isSuccess(status);
+  }
+
+  function po0Subnet(value) {
+    if (typeof value !== 'string') return null;
+    const [address, prefix, ...extra] = value.trim().split('/');
+    if (extra.length || (prefix !== undefined && prefix !== '24')) return null;
+    const ip = normalizeV4(address);
+    return ip ? ip.slice(0, ip.lastIndexOf('.')) : null;
+  }
+
+  function readPo0State(body) {
+    let data;
+    try {
+      data = JSON.parse(body);
+    } catch {
+      return null;
+    }
+    if (!data || typeof data !== 'object') return null;
+    if (data.enabled === false) return { enabled: false, listed: false };
+
+    const currentSubnet = po0Subnet(data.currentIp);
+    if (!currentSubnet || !Array.isArray(data.whitelist)) return null;
+    const listed = data.whitelist.some((entry) => {
+      const address = typeof entry === 'string' ? entry : entry && entry.ip;
+      return po0Subnet(address) === currentSubnet;
+    });
+    return { enabled: data.enabled, listed };
+  }
+
+  async function ensurePo0(token) {
+    const url = `${PO0_API}/${encodeURIComponent(token)}`;
+    const options = { policy: 'DIRECT', headers: { Accept: 'application/json' } };
+    const statusResponse = await request('get', { ...options, url });
+    if (statusResponse.status === 401 || statusResponse.status === 403) {
+      log(`po0 接口拒绝访问（HTTP ${statusResponse.status}），请检查 Token`);
+      return;
+    }
+
+    const current = isSuccess(statusResponse.status) ? readPo0State(statusResponse.body) : null;
+    if (current && current.enabled === false) {
+      log('po0 防火墙尚未启用');
+      return;
+    }
+    if (current && current.listed) {
+      log('当前 IPv4 网段已在 po0 白名单中');
+      return;
+    }
+
+    const added = await requestWithRetry('post', { ...options, url: `${url}/add` }, 'po0 加白');
+    if (!isSuccess(added.status)) return;
+    const result = readPo0State(added.body);
+    if (result && result.enabled === true && result.listed) {
+      log('当前 IPv4 网段已加入 po0 白名单');
+    } else if (result && result.enabled === false) {
+      log('po0 防火墙尚未启用');
+    } else {
+      log('po0 接口未确认当前 IPv4 网段已加白，下次触发时会重新检查');
+    }
   }
 
   async function run() {
     const config = readConfig(typeof $argument === 'undefined' ? '' : $argument);
     if (!config) return;
 
-    const key = `${PREFIX}:${config.method}:${config.api}`;
+    const key = config.po0Token ? `${PREFIX}:po0` : `${PREFIX}:${config.method}:${config.api}`;
     const leaseKey = `${key}:lease`;
     const lease = await takeLease(leaseKey);
     if (!lease) {
@@ -225,6 +298,11 @@
     }
 
     try {
+      if (config.po0Token) {
+        await ensurePo0(config.po0Token);
+        return;
+      }
+
       const addresses = await Promise.all(config.enabled.map((family) => probe(family, config.probes[family])));
       for (const [index, family] of config.enabled.entries()) {
         const ip = addresses[index];
