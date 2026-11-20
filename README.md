@@ -1,6 +1,6 @@
-# Shadowrocket 公网 IP 自动加白
+# iOS 小火箭 po0 加白
 
-Shadowrocket 在收到网络变更事件时检查一次公网 IP，连接期间也按每 5 分钟的计划检查。同一 Wi-Fi 或蜂窝网络下的出口 IP 变化由定时检查发现。首次发现地址或地址变化时，脚本会请求你的 HTTPS 加白接口。IPv4 和 IPv6 分别探测并记录。
+Shadowrocket 在收到网络变更事件时检查一次公网 IP，连接期间也每 5 分钟检查一次。同一 Wi-Fi 或蜂窝网络下的出口 IP 变化由定时检查发现。首次发现地址或地址变化时，脚本会调用你配置的 HTTPS 接口，自动将新地址加入 IP 白名单。IPv4 和 IPv6 分别探测并记录。
 
 模块、脚本和 Mock API 都是独立编写的。需求文档提供的参考仅用于了解 Shadowrocket 配置格式。实际防火墙规则由你配置的接口更新，Mock API 只维护内存中的名单。
 
@@ -17,16 +17,21 @@ npm run prepare:import -- OWNER/REPO
 ## 在 iPhone 上导入
 
 <!-- import:start -->
-发布前，下列地址中的 `OWNER/REPO` 是占位值。运行上一节的命令并推送仓库后，这里会显示对应的导入地址。
+Raw 地址可直接复制到小火箭的模块添加页面。[查看模块](https://raw.githubusercontent.com/FQForge/ios-shadowrocket-po0-ip-whitelist/main/shadowrocket/public-ip-whitelist.srmodule)
 
 ```text
-https://raw.githubusercontent.com/OWNER/REPO/main/shadowrocket/public-ip-whitelist.srmodule
-shadowrocket://install?module=https%3A%2F%2Fraw.githubusercontent.com%2FOWNER%2FREPO%2Fmain%2Fshadowrocket%2Fpublic-ip-whitelist.srmodule
+https://raw.githubusercontent.com/FQForge/ios-shadowrocket-po0-ip-whitelist/main/shadowrocket/public-ip-whitelist.srmodule
+```
+
+也可以将下面的地址粘贴到 iPhone 的 Safari 地址栏，确认打开 Shadowrocket。
+
+```text
+shadowrocket://install?module=https%3A%2F%2Fraw.githubusercontent.com%2FFQForge%2Fios-shadowrocket-po0-ip-whitelist%2Fmain%2Fshadowrocket%2Fpublic-ip-whitelist.srmodule
 ```
 <!-- import:end -->
 
 1. 将 `shadowrocket://install?...` 导入地址粘贴到 iPhone 的 Safari 地址栏，确认打开 Shadowrocket。也可以在 Shadowrocket 里进入「配置 → 模块 → +」，粘贴 Raw 地址并下载。
-2. 点击「公网 IP 自动加白」，打开「编辑参数」，填写下方的参数。当前版本的 Shadowrocket 支持这个入口。旧版本可以先更新，或在小火箭新建本地模块并手动替换两条 `argument` 里的 `{{{参数名}}}`。
+2. 点击「iOS 小火箭 po0 加白」，打开「编辑参数」，填写下方的参数。当前版本的 Shadowrocket 支持这个入口。旧版本可以先更新，或在小火箭新建本地模块并手动替换两条 `argument` 里的 `{{{参数名}}}`。
 3. 启用模块，将首页「全局路由」设为「配置」并连接。这样模块中的 `DIRECT` 规则可以让默认探测走手机当前网络。
 4. 等待下一个 5 分钟刻度，或切换 Wi-Fi 与蜂窝网络。在脚本日志中查找 `[IP 加白]`，并在自己的接口上确认收到的地址。iPhone 只需 Shadowrocket，本模块无需开启 HTTPS 解密。
 
